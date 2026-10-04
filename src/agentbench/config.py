@@ -75,6 +75,12 @@ class McpConfig:
     # so the agent has to model: "exclude_tools": ["*sketchfab*", "*tripo*"]
     include_tools: list[str] | None = None
     exclude_tools: list[str] = field(default_factory=list)
+    # Scene management (Blender MCP): reset the scene before each task and save
+    # the .blend work file into the task directory afterwards, so tasks cannot
+    # pollute each other and every run keeps full evidence. Requires the server
+    # to expose execute_blender_code; reset_scene=False or save_scene=None disables.
+    reset_scene: bool = True
+    save_scene: str | None = "scene.blend"
 
     def validate(self) -> None:
         if self.transport not in MCP_TRANSPORTS:
@@ -117,7 +123,10 @@ class RuntimeConfig:
       plus the host-side helper tools listed in ``tools``.
     * ``builtin``: only this project's own tools (files, Python with trimesh, renderer).
     * ``command``: run any other agent CLI; the runner only fills in the prompt and
-      paths, records its output and scores the model it leaves behind.
+      paths, records its output and scores the model it leaves behind. An optional
+      ``mcp`` block is allowed here too: it is not given to the agent as tools, but
+      lets the runner reset/save the Blender scene around each task (see
+      ``McpConfig.reset_scene`` / ``save_scene``).
     """
 
     type: str = "mcp"
@@ -136,9 +145,9 @@ class RuntimeConfig:
         unknown = [t for t in self.tools if t not in BUILTIN_TOOLS]
         if unknown:
             raise AgentConfigError(f"runtime.tools: unknown tool(s) {unknown}; available: {', '.join(BUILTIN_TOOLS)}")
-        if self.type == "mcp":
-            if self.mcp is None:
-                raise AgentConfigError("runtime.mcp is required when runtime.type is 'mcp'")
+        if self.type == "mcp" and self.mcp is None:
+            raise AgentConfigError("runtime.mcp is required when runtime.type is 'mcp'")
+        if self.mcp is not None:
             self.mcp.validate()
         if self.type == "command":
             if not self.command:
@@ -303,7 +312,8 @@ class BenchConfig:
             seen.add(t.id)
         if not self.workspace_root.is_dir():
             raise AgentConfigError(f"workspace.root does not exist: {self.workspace_root}")
-        if self.runtime.type == "mcp" and self.runtime.mcp.workspace_path:
+        mcp = self.runtime.mcp
+        if self.runtime.type in ("mcp", "command") and mcp and mcp.workspace_path:
             try:
                 self.output_root.relative_to(self.workspace_root)
             except ValueError:

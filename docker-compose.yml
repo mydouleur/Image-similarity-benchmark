@@ -31,6 +31,19 @@ services:
       - ANTHROPIC_API_KEY
       - ANTHROPIC_BASE_URL
       - MCP_URL=${MCP_URL:-http://blender:8000/mcp}
+      # Codex CLI (command runtime, benchmarks/example/command_codex.json):
+      # the image entrypoint turns these into ~/.codex/config.toml.
+      - OPENAI_API_KEY
+      - OPENAI_BASE_URL
+      - CODEX_MODEL
+      - CODEX_PROVIDER
+      - CODEX_BASE_URL
+      - CODEX_ENV_KEY
+      - CODEX_WIRE_API
+      - OPENROUTER_API_KEY
+    depends_on:
+      blender:
+        condition: service_healthy
     volumes:
       - ./data:/app/data
       - ./models:/app/models
@@ -63,4 +76,12 @@ services:
       - ./outputs:/app/outputs
       # agent workspaces only (benchmarks/, which holds the scoring answers, is not mounted here)
       - ./workspaces:/app/workspaces
+    # Healthy once the MCP HTTP endpoint accepts TCP connections (the entrypoint
+    # only starts it after Blender's socket server is up).
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 3).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 60s
     restart: unless-stopped

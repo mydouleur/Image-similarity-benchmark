@@ -513,3 +513,153 @@ def test_model_that_never_answers_ends_as_llm_error(bench, monkeypatch):
     for t in threading.enumerate():
         if t.name.startswith("agentbench-"):
             t.join(5)
+
+
+# ---------------------------------------------------------------------------
+# Blender scene management (reset before each task, save .blend afterwards)
+# ---------------------------------------------------------------------------
+MCP_SCENE_SERVER = textwrap.dedent("""
+    import sys, re
+    from pathlib import Path
+    import trimesh
+    from mcp.server.fastmcp import FastMCP
+
+    LOG = Path(sys.argv[1])
+    FAIL = len(sys.argv) > 2 and sys.argv[2] == "fail"
+    mcp = FastMCP("fake-blender")
+
+    @mcp.tool()
+    def execute_blender_code(code: str) -> str:
+        \"\"\"Pretend to run Blender Python; log the intent of each snippet.\"\"\"
+        marker = ("reset" if "read_factory_settings" in code else
+                  "save" if "save_as_mainfile" in code else "other")
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as fh:
+            fh.write(marker + "\\n")
+        if marker == "save":
+            target = re.search(r"filepath='([^']+)'", code).group(1)
+            Path(target).write_bytes(b"BLEND")
+            return "saved " + target
+        if marker == "reset" and FAIL:
+            raise RuntimeError("boom")
+        return "ok"
+
+    @mcp.tool()
+    def make_box(path: str, size: float = 1.0) -> str:
+        \"\"\"Create a box and save it as glb at path.\"\"\"
+        trimesh.creation.box(extents=[size, size, size]).export(path)
+        return f"saved {path}"
+
+    mcp.run()
+""")
+
+
+def _scene_server(root: Path, log: Path, fail: bool = False) -> dict:
+    server = root / "scene_server.py"
+    server.write_text(MCP_SCENE_SERVER, encoding="utf-8")
+    args = [str(server), str(log)] + (["fail"] if fail else [])
+    return {"transport": "stdio", "command": sys.executable, "args": args}
+
+
+def test_config_command_with_mcp_scene_management(bench):
+    _, write = bench
+    cfg = load_bench_config(write({"type": "command", "command": "echo hi",
+                                   "mcp": {"url": "http://fake:8000/mcp"}}))
+    assert cfg.runtime.mcp.reset_scene is True
+    assert cfg.runtime.mcp.save_scene == "scene.blend"
+
+
+def test_config_command_mcp_workspace_path_requires_output_inside_root(bench):
+    _, write = bench
+    with pytest.raises(AgentConfigError, match="inside workspace.root"):
+        load_bench_config(write({"type": "command", "command": "echo hi",
+                                 "mcp": {"url": "http://fake:8000/mcp", "workspace_path": "/app/ws"}},
+                                workspace={"root": "ws", "output_dir": "../runs"}))
+
+
+def test_command_scene_reset_save_around_task(bench):
+    pytest.importorskip("mcp")
+    root, write = bench
+    log = root / "scene.log"
+    script = ("import sys, trimesh; "
+              "open(sys.argv[1], 'a').write('command\\n'); "
+              "trimesh.creation.box().export(sys.argv[2])")
+    cfg = load_bench_config(write(
+        {"type": "command",
+         "command": [sys.executable, "-c", script, str(log), "{output_model}"],
+         "mcp": _scene_server(root, log)}))
+    run_dir, outcomes = asyncio.run(run_benchmark(cfg))
+    out = outcomes[0]
+    assert out.status == "completed", out.error
+    # reset happens before the agent CLI runs, save after it finishes
+    assert log.read_text().splitlines() == ["reset", "command", "save"]
+    assert (run_dir / "mug" / "scene.blend").read_bytes() == b"BLEND"
+    assert out.scene_blend.endswith("mug/scene.blend")
+    assert out.mcp_server == {"name": "fake-blender", "version": None} or out.mcp_server["name"] == "fake-blender"
+    events = [json.loads(line) for line in (run_dir / "mug" / "transcript.jsonl").read_text().splitlines()]
+    assert any(e["type"] == "scene_reset" and e.get("ok") for e in events)
+    assert any(e["type"] == "scene_saved" for e in events)
+    summary = json.loads((run_dir / "summary.json").read_text())
+    assert "versions" in summary and "git" in summary["versions"]
+
+
+def test_command_scene_reset_failure_fails_task(bench):
+    pytest.importorskip("mcp")
+    root, write = bench
+    log = root / "scene.log"
+    script = ("import sys, trimesh; "
+              "open(sys.argv[1], 'a').write('command\\n'); "
+              "trimesh.creation.box().export(sys.argv[2])")
+    cfg = load_bench_config(write(
+        {"type": "command",
+         "command": [sys.executable, "-c", script, str(log), "{output_model}"],
+         "mcp": _scene_server(root, log, fail=True)}))
+    run_dir, outcomes = asyncio.run(run_benchmark(cfg))
+    out = outcomes[0]
+    # a dirty scene must fail the task rather than contaminate it
+    assert out.status == "error" and "scene reset failed" in out.error
+    assert log.read_text().splitlines() == ["reset"]  # agent CLI never ran
+    assert not (run_dir / "mug" / "model.glb").exists()
+
+
+def test_command_scene_management_disabled(bench):
+    pytest.importorskip("mcp")
+    root, write = bench
+    log = root / "scene.log"
+    script = "import sys, trimesh; trimesh.creation.box().export(sys.argv[1])"
+    cfg = load_bench_config(write(
+        {"type": "command",
+         "command": [sys.executable, "-c", script, "{output_model}"],
+         "mcp": {**_scene_server(root, log), "reset_scene": False, "save_scene": None}}))
+    run_dir, outcomes = asyncio.run(run_benchmark(cfg))
+    assert outcomes[0].status == "completed", outcomes[0].error
+    assert not log.exists()  # neither reset nor save was attempted
+    assert outcomes[0].scene_blend is None
+
+
+def test_mcp_runtime_scene_lifecycle(bench, monkeypatch):
+    pytest.importorskip("mcp")
+    root, write = bench
+    monkeypatch.setenv("TEST_AGENT_KEY", "sk-test")
+    log = root / "scene.log"
+    cfg = load_bench_config(write(
+        {"type": "mcp", "tools": [], "mcp": _scene_server(root, log)}, OPENAI_LLM))
+    out_path = {}
+
+    class Script(ScriptedOpenAI):
+        def __call__(self, req, timeout=None):
+            body = json.loads(req.data.decode())
+            if not self.requests:
+                system = body["messages"][0]["content"]
+                path = system.split("ONE .glb file at: ")[1].split("\n")[0].strip()
+                out_path["p"] = path
+                self.script = [{"content": "", "tool_calls": [call(1, "make_box", {"path": path, "size": 0.8})]},
+                               {"content": "done"}]
+            return super().__call__(req, timeout)
+
+    run_dir, outcomes = asyncio.run(run_benchmark(cfg, llm_factory=lambda c: OpenAIChatClient(c, urlopen=Script([]))))
+    out = outcomes[0]
+    assert out.status == "completed", out.error
+    assert log.read_text().splitlines() == ["reset", "save"]
+    assert (run_dir / "mug" / "scene.blend").read_bytes() == b"BLEND"
+    assert out.scene_blend.endswith("mug/scene.blend")

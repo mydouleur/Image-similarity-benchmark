@@ -1,0 +1,63 @@
+{
+  "name": "codex-blender",
+  "description": "Codex CLI (headless `codex exec`) drives the headless Blender MCP container. The benchmark image ships the codex binary and turns CODEX_* / MCP_URL env vars into ~/.codex/config.toml (see docker/benchmark/codex-entrypoint.sh). Switch models with CODEX_MODEL; use OpenRouter by setting CODEX_PROVIDER/CODEX_BASE_URL/CODEX_ENV_KEY in .env. The runtime.mcp block is not given to the agent: the runner uses it to reset the Blender scene before each task and save scene.blend into the task directory afterwards.",
+
+  "runtime": {
+    "type": "command",
+    "command": [
+      "codex", "exec", "--json", "--skip-git-repo-check",
+      "--sandbox", "workspace-write",
+      "{prompt}"
+    ],
+    "mcp": {
+      "transport": "streamable_http",
+      "url": "${MCP_URL:-http://blender:8000/mcp}",
+      "workspace_path": "/app/workspaces/example",
+      "timeout_seconds": 300
+    },
+    "env": {}
+  },
+
+  "llm": {
+    "api_format": "openai",
+    "base_url": "${LLM_BASE_URL:-https://api.openai.com/v1}",
+    "api_key": "${OPENAI_API_KEY}",
+    "model": "${CODEX_MODEL:-gpt-5-codex}"
+  },
+
+  "workspace": {
+    "root": "../../workspaces/example",
+    "output_dir": "runs"
+  },
+
+  "limits": {
+    "timeout_seconds": 1800
+  },
+
+  "evaluation": {
+    "enabled": true,
+    "auto_orient": true,
+    "feedback_rounds": 0
+  },
+
+  "tasks": [
+    {
+      "id": "mug",
+      "prompt": "做一个马克杯的三维模型：圆柱形杯身，杯口敞开、杯壁有一定厚度，平底，侧面有一个 C 形把手。形状和比例以参考图片为准。参考图在当前目录的 refs/mug/ 下。用 Blender MCP 的工具建模，把最终模型导出为一个 glb。",
+      "reference_images": ["refs/mug/*.png"],
+      "reference_model": "answers/mug.glb"
+    },
+    {
+      "id": "table",
+      "prompt": "做一张长方形餐桌的三维模型：薄薄的长方形桌面，四条方形桌腿垂直立在四个角附近。形状和比例以参考图片为准。参考图在当前目录的 refs/table/ 下。用 Blender MCP 的工具建模，把最终模型导出为一个 glb。",
+      "reference_images": ["refs/table/*.png"],
+      "reference_model": "answers/table.glb"
+    },
+    {
+      "id": "chair",
+      "prompt": "做一把简单的椅子的三维模型：方形座面，四条方腿，后面有两根立柱和一块横向靠背板，椅子正面朝向观察者。形状和比例以参考图片为准。参考图在当前目录的 refs/chair/ 下。用 Blender MCP 的工具建模，把最终模型导出为一个 glb。",
+      "reference_images": ["refs/chair/*.png"],
+      "reference_model": "answers/chair.glb"
+    }
+  ]
+}

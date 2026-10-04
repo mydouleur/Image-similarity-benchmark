@@ -280,6 +280,8 @@ class TaskOutcome:
     output_tokens: int = 0
     elapsed_seconds: float = 0.0
     model_path: str | None = None
+    scene_blend: str | None = None
+    mcp_server: dict[str, Any] | None = None
     final_message: str = ""
     error: str | None = None
     generated: list[dict[str, Any]] = field(default_factory=list)
@@ -348,6 +350,75 @@ class TaskRunner:
             b["text"] if b["type"] == "text" else "[image]" for b in user)
         (self.task_dir / "prompt.md").write_text(text, encoding="utf-8")
 
+    # -- Blender scene management (reset before, save after) ---------------------
+    SCENE_RESET_CODE = (
+        "import bpy\n"
+        "bpy.ops.wm.read_factory_settings(use_empty=True)\n"
+        "for _ in range(3):\n"
+        "    bpy.data.orphans_purge(do_recursive=True)\n"
+        "print('scene reset ok')"
+    )
+
+    def _log_mcp(self, conn: McpConnection, purpose: str | None = None) -> None:
+        self.out.mcp_server = {"name": conn.server_info.get("name"), "version": conn.server_info.get("version")}
+        self.rec.event("mcp_connected", server=conn.server_info, tools=[t.name for t in conn.tools], purpose=purpose)
+        self.rec.md(f"MCP server: {conn.server_info.get('name')} {conn.server_info.get('version') or ''}"
+                    + (f" ({purpose})" if purpose else "")
+                    + f", {len(conn.tools)} tools: " + ", ".join(f"`{t.name}`" for t in conn.tools))
+
+    def _scene_tool_ready(self, conn: McpConnection) -> bool:
+        return "execute_blender_code" in conn.all_tools
+
+    async def _scene_reset(self, conn: McpConnection) -> None:
+        """Wipe the Blender scene so no leftovers from a previous task remain.
+
+        A failed reset marks the task as failed: running on a dirty scene would
+        silently contaminate both the model and its score.
+        """
+        mcp_cfg = self.cfg.runtime.mcp
+        if not mcp_cfg or not mcp_cfg.reset_scene:
+            return
+        if not self._scene_tool_ready(conn):
+            self.rec.event("scene_reset", skipped="execute_blender_code not offered by the server")
+            logger.warning("[%s] scene reset skipped: server has no execute_blender_code", self.task.id)
+            return
+        blocks, is_error = await conn.call("execute_blender_code", {"code": self.SCENE_RESET_CODE},
+                                           mcp_cfg.timeout_seconds)
+        detail = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        self.rec.event("scene_reset", ok=not is_error, detail=truncate(detail, 2000))
+        self.rec.md("## Scene reset\n\n```text\n" + truncate(detail, 2000).replace("```", "ʼʼʼ") + "\n```")
+        if is_error:
+            raise RuntimeError(f"Blender scene reset failed: {detail[:500]}")
+
+    async def _scene_save(self, conn: McpConnection) -> None:
+        """Save the .blend work file into the task directory (best effort)."""
+        mcp_cfg = self.cfg.runtime.mcp
+        if not mcp_cfg or not mcp_cfg.save_scene or not self._scene_tool_ready(conn):
+            return
+        host_path = self.task_dir / mcp_cfg.save_scene
+        host_path.parent.mkdir(parents=True, exist_ok=True)
+        target = mcp_path(self.cfg, host_path, self.ctx)
+        code = (f"import bpy\nbpy.ops.wm.save_as_mainfile(filepath={target!r}, check_existing=False)\n"
+                "print('saved', bpy.data.filepath)")
+        try:
+            blocks, is_error = await conn.call("execute_blender_code", {"code": code}, mcp_cfg.timeout_seconds)
+        except Exception as exc:
+            logger.warning("[%s] saving scene.blend failed: %s", self.task.id, exc)
+            self.rec.event("scene_saved", error=f"{type(exc).__name__}: {exc}")
+            return
+        detail = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        if is_error:
+            logger.warning("[%s] saving scene.blend failed: %s", self.task.id, detail[:300])
+            self.rec.event("scene_saved", error=truncate(detail, 2000))
+            return
+        self.rec.event("scene_saved", path=target)
+        if host_path.is_file():
+            self.out.scene_blend = self.ctx.rel(host_path)
+            self.rec.md(f"Scene saved: `{self.out.scene_blend}`")
+        else:
+            logger.warning("[%s] scene saved on the MCP server at %s but not visible on the host at %s",
+                           self.task.id, target, host_path)
+
     # -- entry point --------------------------------------------------------------
     async def run(self) -> TaskOutcome:
         t0 = time.monotonic()
@@ -358,13 +429,27 @@ class TaskRunner:
         try:
             images = reference_images(self.cfg, self.task)
             if self.cfg.runtime.type == "command":
-                await self._run_command(images)
+                if self.cfg.runtime.mcp is not None:
+                    # Optional scene management for external agent CLIs: the runner
+                    # resets the Blender scene before the task and saves the .blend
+                    # work file afterwards; no MCP tools are given to the agent.
+                    async with McpConnection(self.cfg.runtime.mcp) as conn:
+                        self._log_mcp(conn, purpose="scene management only")
+                        await self._scene_reset(conn)
+                        try:
+                            await self._run_command(images)
+                        finally:
+                            await self._scene_save(conn)
+                else:
+                    await self._run_command(images)
             elif self.cfg.runtime.type == "mcp":
                 async with McpConnection(self.cfg.runtime.mcp) as conn:
-                    self.rec.event("mcp_connected", server=conn.server_info, tools=[t.name for t in conn.tools])
-                    self.rec.md(f"MCP server: {conn.server_info.get('name')} {conn.server_info.get('version') or ''}, "
-                                f"{len(conn.tools)} tools: " + ", ".join(f"`{t.name}`" for t in conn.tools))
-                    await self._run_agent(images, Toolbox(self.ctx, self.cfg.runtime.tools, conn), conn)
+                    self._log_mcp(conn)
+                    await self._scene_reset(conn)
+                    try:
+                        await self._run_agent(images, Toolbox(self.ctx, self.cfg.runtime.tools, conn), conn)
+                    finally:
+                        await self._scene_save(conn)
             else:
                 await self._run_agent(images, Toolbox(self.ctx, self.cfg.runtime.tools), None)
         except Exception as exc:
@@ -538,11 +623,16 @@ class TaskRunner:
     def _command_prompt(self, images: list[Path], extra: str = "") -> str:
         text = first_message(self.task, images, self.ctx, attach=False)[0]["text"].replace(
             "look at them with read_image", "open the image files")
-        return (f"{text}\n\nRequirements (automated, headless benchmark; nobody will answer questions):\n"
-                f"- Save the final model as ONE .glb file at: {self.ctx.output_model}\n"
-                f"- Use +Y as up and make the front of the object face +Z.\n"
-                f"- The model is scored by comparing six orthographic silhouettes with a hidden reference model.\n"
-                + (f"\n{extra}\n" if extra else ""))
+        lines = [f"{text}\n\nRequirements (automated, headless benchmark; nobody will answer questions):",
+                 f"- Save the final model as ONE .glb file at: {self.ctx.output_model}"]
+        mcp = self.cfg.runtime.mcp
+        if mcp is not None and mcp.workspace_path:
+            lines.append(f"- Files read or written through the MCP server use the server's paths: the workspace is "
+                         f"{mcp.workspace_path.rstrip('/')} there, so export the model through the server to "
+                         f"{mcp_path(self.cfg, self.ctx.output_model, self.ctx)} (the same file as the path above).")
+        lines += ["- Use +Y as up and make the front of the object face +Z.",
+                  "- The model is scored by comparing six orthographic silhouettes with a hidden reference model."]
+        return "\n".join(lines) + (f"\n{extra}\n" if extra else "")
 
     def _command_env(self) -> dict[str, str]:
         env = {**os.environ, **self.cfg.runtime.env,
@@ -617,7 +707,7 @@ class TaskRunner:
                     raw = await stream.readline()
                     if not raw:
                         break
-                    line = raw.decode("utf-8", "replace").rstrip("\n")
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
                     log.write(line + "\n")
                     log.flush()
                     data: Any = None
@@ -667,11 +757,32 @@ def create_run_dir(cfg: BenchConfig) -> Path:
     return run_dir
 
 
+def version_stamp() -> dict[str, Any]:
+    """Package + git revision of this checkout, for run traceability."""
+    stamp: dict[str, Any] = {"package": None, "git": None}
+    try:
+        from importlib.metadata import version
+        stamp["package"] = version("image-similarity-benchmark")
+    except Exception:
+        pass
+    try:
+        import subprocess
+        root = Path(__file__).resolve().parent.parent.parent
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root,
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            stamp["git"] = out.stdout.strip()
+    except Exception:
+        pass
+    return stamp
+
+
 def write_summary(cfg: BenchConfig, run_dir: Path, outcomes: list[TaskOutcome], started: datetime) -> None:
     scores = [o.score for o in outcomes if o.score is not None]
     data = {
         "name": cfg.name, "description": cfg.description, "started": started.isoformat(timespec="seconds"),
         "finished": datetime.now().isoformat(timespec="seconds"), "runtime": cfg.runtime.type,
+        "versions": version_stamp(),
         "llm": {"api_format": cfg.llm.api_format, "model": cfg.llm.model, "base_url": cfg.llm.base_url} if cfg.llm else None,
         "mean_score": sum(scores) / len(scores) if scores else None,
         "tasks": [asdict(o) for o in outcomes],
